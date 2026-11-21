@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Jabyrinth</title>
+<style>
+:root{--bg:#12131c;--panel:#1c1d2b;--ink:#e8e6f0;--dim:#8b8da6;--accent:#3cb4e6}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:14px/1.3 ui-monospace,Menlo,Consolas,monospace;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#app{display:flex;flex-direction:column;height:100%}
+#bar{display:flex;align-items:center;gap:14px;padding:8px 12px;background:var(--panel);border-bottom:2px solid #000;flex-wrap:wrap}
+#bar .title{font-weight:bold;letter-spacing:3px}
+#bar .seed{color:var(--dim)}
+#bar .hint{color:var(--dim)}
+#bar .spacer{flex:1}
+button{font:inherit;color:var(--ink);background:#2b2f45;border:2px solid #000;border-radius:0;padding:6px 12px;cursor:pointer;
+  box-shadow:inset -2px -2px 0 #1a1c2a,inset 2px 2px 0 #4a5070}
+button:active{box-shadow:inset 2px 2px 0 #1a1c2a,inset -2px -2px 0 #4a5070}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#stage{flex:1;position:relative;min-height:0}
+#view{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;display:block}
+#toast{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);background:var(--panel);border:2px solid #000;box-shadow:inset -2px -2px 0 #14151f,inset 2px 2px 0 #3a3f5c;padding:8px 14px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90%;text-align:center}
+#toast.show{opacity:1}
+#toast b{color:#f0d060}
+#overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(10,10,18,.6)}
+#overlay.show{display:flex}
+#overlay .box{background:var(--panel);border:2px solid #000;box-shadow:inset -3px -3px 0 #14151f,inset 3px 3px 0 #3a3f5c;padding:20px 28px;text-align:center}
+#overlay h2{margin:0 0 6px;letter-spacing:4px;color:#f0d060}
+#overlay h2.bad{color:#e83b3b}
+#overlay p{margin:0 0 14px;color:var(--dim)}
+#overlay .btns{display:flex;gap:10px;justify-content:center}
+.touch-only{display:none}
+@media (pointer:coarse){.touch-only{display:inline}.key-only{display:none}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <span class="title">JABYRINTH</span>
+    <span class="seed" id="seedLabel"></span>
+    <span class="spacer"></span>
+    <span class="hint"><span class="key-only">Arrows / WASD move · Space attack · N new maze</span><span class="touch-only">Swipe to move · Tap to attack</span></span>
+    <button id="newBtn" type="button">New Maze</button>
+  </div>
+  <div id="stage">
+    <canvas id="view" aria-label="Jabyrinth game"></canvas>
+    <div id="toast" aria-live="polite"></div>
+    <div id="overlay" role="dialog" aria-live="polite">
+      <div class="box">
+        <h2 id="ovTitle">ESCAPED!</h2>
+        <p id="ovText"></p>
+        <div class="btns">
+          <button id="retryBtn" type="button">Try Again</button>
+          <button id="againBtn" type="button">New Maze</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+/* =========================================================================
+   JABYRINTH: offline, single-file pixel-art maze game.
+     1. CONFIG
+     2. PALETTE + SPRITES   (string grids now; Jcon SVG blocks can be loaded via spriteFromSVG)
+     3. RNG + MAZE GENERATION (seeded, so any maze can be replayed)
+     4. GAME STATE + EVENTS  (hooks for timer, move counter, collectibles...)
+     5. PLAYER, COMBAT, ENEMIES
+     6. INPUT                (keyboard, swipe, tap)
+     7. RENDER               (layered: map -> trail -> items -> exit -> enemies -> player -> sword -> fog -> HUD)
+     8. LOOP + BOOT
+   ========================================================================= */
+
+/* ---------- 1. CONFIG ---------- */
+const TILE = 16;              // grid square size in art pixels. Walls are 1 square thick, paths 2 squares wide (32px)
+const CHAR = 16;              // character / enemy / item sprite size: one grid square
+const INSET = (TILE - CHAR) / 2;
+const CONFIG = {
+  cellsW: 12, cellsH: 12,     // maze size in cells (tiles = cells*2+1)
+  moveMs: 95,                 // player: time to move one grid square (16px)
+  viewTiles: 16,              // about how many grid squares fit across the screen's short side
+  leadPx: 1,                  // art pixels the character leans toward the way it's walking
+  leadEase: 18,               // how fast the lean comes and goes
+
+  playerMaxHp: 100,
+  enemyDamage: 20,            // % of health lost per enemy touch
+  hurtInvulnMs: 1000,         // blink time after getting hit (can't be hit again)
+
+  swingMs: 180,               // sword swing length (hits during the whole swing; you can walk while swinging)
+  attackCooldownMs: 300,      // time from one swing start to the next
+  swordReach: 8,              // art pixels the hit area reaches past the character's front edge
+
+  enemyCount: 1,
+  enemyHp: 3,                 // sword hits to defeat
+  enemyMoveMs: 240,           // enemy: time to move one grid square (slower than player)
+  enemyPauseChance: 0.05,     // chance to stop for a moment
+  enemyStraightChance: 0.6,   // chance to keep going the same way when it could turn
+  enemyStunMs: 450,           // frozen after being hit
+  enemyAfterBiteMs: 700,      // enemy pauses after touching the player
+  knockbackMs: 80,
+
+  lightRadius: 36,            // art pixels you can see around you in the dark
+  torchMultiplier: 2,         // torch: light radius x2
+  mapLineColor: 'rgba(216,200,154,0.55)', // map: color of the dotted maze outline shown in the dark
+  shieldFactor: 0.5,          // shield: damage multiplier
+};
+
+/* ---------- 2. PALETTE + SPRITES ---------- */
+const PAL = {
+  'o':'#1a1424',                                             // outline
+  'd':'#6b3e26','D':'#4a2a1a','b':'#f5c49c','e':'#1a1a1a',   // hair, hair shade, skin, eye
+  'c':'#3cb4e6','C':'#2a8bb8','h':'#4a3a2a','p':'#3a3f6a','f':'#7a4a2a', // shirt, shirt shade, belt, pants, boots
+  'G':'#5fc95a','L':'#a8f08a','S':'#2f7a3a','k':'#14141c','W':'#ffffff', // slime
+  '7':'#c9c9c9','8':'#e83b3b','R':'#a8242c',                 // flag
+  'r':'#e83b3b',                                             // heart
+  'g':'#f0d060','q':'#b08a2a',                               // gold, dark gold
+  'y':'#c98a3e','Y':'#e8b86a','z':'#8a5a24',                 // bread
+  'm':'#9fb0c8','M':'#5a6988','n':'#3b5bdb','N':'#6b8bff',   // shield metal / blue
+  'a':'#ff9a2a','A':'#ffe066','x':'#e8442a',                 // flame
+  'u':'#e8dcb0','U':'#c4b07a','v':'#8a6a3a',                 // map paper
+  'j':'#8a5a2a','J':'#5a3a1a','i':'#b0b8c8',                 // chest wood / bands
+};
+
+// ---- Hero (16x16): head + body + legs, assembled per direction. Left = mirrored right.
+const HERO = {
+  head:{
+    down:["................",".....oooooo.....","....odddddDo....","...odddddddDo...","...oddddddddo...",
+          "...odbbbbbbdo...","...obbebbebbo...","...obbebbebbo...","....obbbbbbo...."],
+    up:  ["................",".....oooooo.....","....odddddDo....","...odddddddDo...","...oddddddddo...",
+          "...oddddddddo...","...odddddddDo...","...oDdddddDDo...","....obbbbbbo...."],
+    right:["................",".....oooooo.....","....odddddDo....","...odddddddDo...","...oddddddddo...",
+          "...oddddbbbbo...","...odddbbbebo...","...oddbbbbebo...","....obbbbbbo...."],
+  },
+  body:{
+    front:["...occcccccco...","..obcccccccCbo..","..obcccccccCbo..","...ohhhhhhhho...","...oppppppppo..."],
+    side: ["....occcccco....","....occbbcco....","....occbbcco....","....ohhhhhho....","....oppppppo...."],
+  },
+  legs:{
+    front:{ stand:["...oppo..oppo...","...offo..offo..."], a:["...offo..oppo...","...oooo..offo..."], b:["...oppo..offo...","...offo..oooo..."] },
+    side: { stand:["....opppppo.....","....offfffo....."], a:["...oppo.oppo....","..offo...offo..."], b:["....opppppo.....","....offfffo....."] },
+  }
+};
+function heroFrames(dir){
+  const kind = dir === 'right' ? 'side' : 'front';
+  return ['stand','a','b'].map(k => [...HERO.head[dir], ...HERO.body[kind], ...HERO.legs[kind][k]]);
+}
+
+const SRC = {
+  slime:[
+    ["................","................","................","................","................","................",
+     "......oooo......","....ooGGGGoo....","...oGLLGGGGGo...","..oGLGGGGGGGGo..",".oGGGkWGGkWGGGo.",".oGGGkkGGkkGGGo.",
+     ".oGGGGGGGGGGGGo.",".oGGGGGGGGGGGGo.","..oSSSSSSSSSSo..","...oooooooooo..."],
+    ["................","................","................","................","................","................",
+     "................","......oooo......","....ooGGGGoo....","..ooGLGGGGGGoo..",".oGLGGGGGGGGGGo.","oGGGGkWGGkWGGGGo",
+     "oGGGGkkGGkkGGGGo","oGGGGGGGGGGGGGGo","oSSSSSSSSSSSSSSo",".oooooooooooooo."]],
+  exit:["................","....77..........","....7788888.....","....778888888...","....7788888888..","....778888888...",
+        "....77RRRRR.....","....77..........","....77..........","....77..........","....77..........","....77..........",
+        "....77..........","....77..........","...7777.........","..777777........"],
+  poof:[
+    ["........","...W....",".W...W..","...WW...","..WW....",".W...W..","....W...","........"],
+    ["W......W","........","..W..W..","........","........","..W..W..","........","W......W"]],
+  heart:[".rr.rr.","rrrrrrr","rrrrrrr",".rrrrr.","..rrr..","...r..."],
+  lock:["..oooo..",".om..mo.",".om..mo.","oooooooo","oggggqgo","oggkkggo","ogggkggo","oooooooo"],
+  chest:[
+    ["................","................","................","..oooooooooooo..",".ojjjjjjjjjjjjo.",".oJjjjjjjjjjjJo.",
+     ".oiiiiiiiiiiiio.",".oJjjjjggjjjjJo.",".ooooooggoooooo.",".ojjjjjggjjjjjo.",".oJjjjjjjjjjjJo.",".oiiiiiiiiiiiio.",
+     ".oJjjjjjjjjjjJo.",".oJJJJJJJJJJJJo.","..oooooooooooo..","................"],
+    ["................","..oooooooooooo..",".ojjjjjjjjjjjjo.",".oiiiiiiiiiiiio.",".oJjjjjjjjjjjJo.",".oooooooooooooo.",
+     ".okkkkkkkkkkkko.",".okkkkkkkkkkkko.",".ooooooggoooooo.",".ojjjjjggjjjjjo.",".oJjjjjjjjjjjJo.",".oiiiiiiiiiiiio.",
+     ".oJjjjjjjjjjjJo.",".oJJJJJJJJJJJJo.","..oooooooooooo..","................"]],
+  items:{
+    bread:["................","................","................","................","................",".....oooooo.....",
+           "...ooYYYYYYoo...","..oYYyYYyYYyYo..",".oYyYYyYYyYYyYo.",".oyyyyyyyyyyyyo.",".oyyyyyyyyyyyyo.",".ozyyyyyyyyyyzo.",
+           "..ozzzzzzzzzzo..","...oooooooooo...","................","................"],
+    shield:["................","..oooooooooooo..",".ommmmmmmmmmmmo.",".omnnnnggnnnnmo.",".omnNnnggnnnnmo.",".omnNnnggnnnnmo.",
+            ".omggggggggggmo.",".omggggggggggmo.",".omnNnnggnnnnmo.","..omnnnggnnnmo..","..omnnnggnnnmo..","...omnnggnnmo...",
+            "....omnggnmo....",".....ommmmo.....","......oooo......","................"],
+    key:["................","................","................","................","..oooo..........",".oqggqo.........",
+         "oqgoogqoooooooo.","ogo..oggggggggo.","oqgoogqoooqgoqo.",".oqggqo...oqoqo.","..oooo....ooooo.","................",
+         "................","................","................","................"],
+    torch:[".......oo.......","......oAAo......",".....oAAAAo.....",".....oAaaAo.....","....oaAaaaao....","....oaaxxaao....",
+           ".....oaxxao.....","....oMMMMMMo....",".....oMmmMo.....","......ohho......","......ofho......","......ofho......",
+           "......ofho......","......ofho......","......ofho......",".......oo......."],
+    map:["................","................","..oooooooooooo..",".oUuuuuuuuuuuUo.",".oUuvvuuuuuuuUo.",".oUuuvuuuxuxuUo.",
+         ".oUuuvvvuuxuuUo.",".oUuuuuvuxuxuUo.",".oUuuuuvvvuuuUo.",".oUuuuuuuvuuuUo.",".oUuuuuuuvvuuUo.",".oUuuuuuuuuuuUo.",
+         "..oooooooooooo..","................","................","................"],
+  },
+};
+const ITEMS = {
+  sword:  { name:'Sword',         desc:'You can attack! (Space / tap)' },
+  shield: { name:'Shield',        desc:'Enemies do half damage.' },
+  key:    { name:'Key',           desc:'This unlocks the exit.' },
+  torch:  { name:'Torch',         desc:'Your light reaches twice as far.' },
+  map:    { name:'Map',           desc:'The maze shows as a dotted outline in the dark.' },
+  bread:  { name:'Loaf of Bread', desc:'You leave a crumb trail behind you.' },
+};
+const ITEM_ORDER = ['sword', 'shield', 'key', 'torch', 'map', 'bread'];
+
+function makeSprite(rows, flipX, flipY, scale = 1){
+  const h = rows.length, w = rows[0].length;
+  const c = document.createElement('canvas'); c.width = w * scale; c.height = h * scale;
+  const x = c.getContext('2d');
+  for (let y = 0; y < h; y++) for (let i = 0; i < w; i++){
+    const col = PAL[rows[y][i]]; if (!col) continue;
+    x.fillStyle = col; x.fillRect((flipX ? w - 1 - i : i) * scale, (flipY ? h - 1 - y : y) * scale, scale, scale);
+  }
+  return c;
+}
+function rotateSprite(src, quarterTurns){ // clockwise, exact for pixel art
+  const c = document.createElement('canvas'); c.width = src.width; c.height = src.height;
+  const x = c.getContext('2d');
+  x.translate(src.width / 2, src.height / 2); x.rotate(quarterTurns * Math.PI / 2);
+  x.drawImage(src, -src.width / 2, -src.height / 2);
+  return c;
+}
+function whiteSilhouette(src){
+  const c = document.createElement('canvas'); c.width = src.width; c.height = src.height;
+  const x = c.getContext('2d'); x.drawImage(src, 0, 0);
+  x.globalCompositeOperation = 'source-in'; x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
+  return c;
+}
+function canvasOf(w, h, draw){
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d'); draw(x, (px, py, col) => { x.fillStyle = col; x.fillRect(px, py, 1, 1); });
+  return c;
+}
+
+// ---- Sword (16x16), drawn procedurally at an angle, pointing RIGHT from the hilt at (2,7.5)
+function swordSprite(deg){
+  return canvasOf(16, 16, (x, put) => {
+    const a = deg * Math.PI / 180, dx = Math.cos(a), dy = Math.sin(a), qx = -dy, qy = dx;
+    const at = (t, s) => [Math.round(2 + dx * t + qx * s), Math.round(7 + dy * t + qy * s)];
+    for (let t = -1; t <= 0; t++){ put(...at(t, 0), '#7a4a2a'); put(...at(t, 1), '#5a3520'); } // grip
+    for (let s = -2; s <= 3; s++) put(...at(1, s), '#f0d060');                // guard
+    for (let t = 2; t <= 9; t++){ put(...at(t, 0), '#eef3fa'); if (t < 9) put(...at(t, 1), '#9fb0c8'); } // blade + edge shade
+  });
+}
+
+// ---- Map tiles (32x32), drawn procedurally with a fixed seed so they look the same every time
+const tileRng = mulberry32(0xC0FFEE);
+const speck = (put, n, col, x0 = 0, y0 = 0, w = TILE, h = TILE) => {
+  for (let i = 0; i < n; i++) put(x0 + ((tileRng() * w) | 0), y0 + ((tileRng() * h) | 0), col);
+};
+function wallSurface(x, put, h){
+  x.fillStyle = '#5a6988'; x.fillRect(0, 0, TILE, h);
+  speck(put, 6, '#67779a', 0, 0, TILE, h); speck(put, 3, '#4e5c7a', 0, 0, TILE, h); speck(put, 1, '#8b9bb4', 0, 0, TILE, h);
+}
+const makeWallTop = () => canvasOf(TILE, TILE, (x, put) => wallSurface(x, put, TILE));
+const makeWallFace = () => canvasOf(TILE, TILE, (x, put) => {
+  wallSurface(x, put, 5);
+  x.fillStyle = '#8b9bb4'; x.fillRect(0, 5, TILE, 1);                        // edge highlight
+  x.fillStyle = '#23263a'; x.fillRect(0, 6, TILE, TILE - 6);                // mortar
+  for (let row = 0; row < 2; row++){
+    const y = 7 + row * 5, off = row % 2 ? 4 : 0;
+    for (let bx = -off; bx < TILE; bx += 8){
+      const x0 = Math.max(0, bx), x1 = Math.min(TILE, bx + 7);
+      x.fillStyle = '#3e4766'; x.fillRect(x0, y, x1 - x0, 4);
+      x.fillStyle = '#4a5577'; x.fillRect(x0, y, x1 - x0, 1);               // brick top light
+    }
+  }
+});
+const makeFloor = () => canvasOf(TILE, TILE, (x, put) => {
+  const tones = ['#26222f', '#282432', '#24202c', '#272331'];
+  x.fillStyle = tones[(tileRng() * tones.length) | 0]; x.fillRect(0, 0, TILE, TILE);
+  x.fillStyle = '#2d2938'; x.fillRect(1, 1, TILE - 2, 1);                   // stone top light
+  x.fillStyle = '#1b1823'; x.fillRect(0, 0, TILE, 1); x.fillRect(0, 0, 1, TILE); // mortar
+  speck(put, 4, '#302b3b'); speck(put, 2, '#1f1c27');
+});
+
+/* Converts a Jcon-exported SVG block (made of <rect> pixels) into a sprite.
+   'currentColor' (theme icons) is drawn with `ink`. Parsing only: nothing runs. */
+function spriteFromSVG(svgText, ink = '#000'){
+  const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+  const svg = doc.querySelector('svg'); if (!svg) return null;
+  const vb = (svg.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+  const w = vb.length === 4 ? vb[2] : (parseFloat(svg.getAttribute('width')) || CHAR);
+  const h = vb.length === 4 ? vb[3] : (parseFloat(svg.getAttribute('height')) || CHAR);
+  const ox = vb.length === 4 ? vb[0] : 0, oy = vb.length === 4 ? vb[1] : 0;
+  const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h));
+  const x = c.getContext('2d');
+  svg.querySelectorAll('rect').forEach(r => {
+    let f = r.getAttribute('fill') || (r.style && r.style.fill) || svg.getAttribute('fill') || '#000';
+    if (f === 'none' || f === 'transparent') return;
+    if (f === 'currentColor') f = ink;
+    x.fillStyle = f;
+    x.fillRect((+r.getAttribute('x') || 0) - ox, (+r.getAttribute('y') || 0) - oy,
+               +r.getAttribute('width') || 1, +r.getAttribute('height') || 1);
+  });
+  return c;
+}
+
+const TURNS = { right:0, down:1, left:2, up:3 };
+const swordBase = [swordSprite(-45), swordSprite(0), swordSprite(45)];
+const SPR = {
+  wallTop: [makeWallTop(), makeWallTop(), makeWallTop()],
+  wallFace: [makeWallFace(), makeWallFace()],
+  floor: [makeFloor(), makeFloor(), makeFloor(), makeFloor()],
+  exit: makeSprite(SRC.exit),
+  hero: {
+    down: heroFrames('down').map(r => makeSprite(r)),
+    up: heroFrames('up').map(r => makeSprite(r)),
+    right: heroFrames('right').map(r => makeSprite(r)),
+    left: heroFrames('right').map(r => makeSprite(r, true)),
+  },
+  sword: Object.fromEntries(Object.entries(TURNS).map(([d, t]) => [d, swordBase.map(s => rotateSprite(s, t))])),
+  slime: SRC.slime.map(r => makeSprite(r)),
+  poof: SRC.poof.map(r => makeSprite(r, false, false, 2)),
+  heart: makeSprite(SRC.heart),
+};
+SPR.slimeFlash = SPR.slime.map(whiteSilhouette);
+SPR.lock = makeSprite(SRC.lock);
+SPR.chest = SRC.chest.map(r => makeSprite(r));
+SPR.items = Object.fromEntries(Object.entries(SRC.items).map(([k, r]) => [k, makeSprite(r)]));
+SPR.items.sword = canvasOf(16, 16, (x, put) => {     // diagonal sword icon
+  for (let t = 0; t <= 8; t++){ put(5 + t, 10 - t, '#eef3fa'); put(6 + t, 10 - t, '#9fb0c8'); }
+  put(14, 1, '#eef3fa');
+  for (let k = -2; k <= 2; k++) put(4 + k, 11 + k, '#f0d060');   // guard
+  put(3, 12, '#7a4a2a'); put(2, 13, '#7a4a2a'); put(1, 14, '#f0d060'); // grip + pommel
+});
+
+/* ---------- 3. RNG + MAZE GENERATION ---------- */
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function randomSeed(){ const a = new Uint32Array(1); crypto.getRandomValues(a); return a[0]; }
+
+// Recursive backtracker (iterative) over cells, then drawn onto the fine grid:
+// each cell = 2x2 floor squares, walls 1 square thick. Grid: 1 = wall, 0 = floor.
+// A "perfect" maze: exactly one route between any two cells.
+function generateMaze(cw, ch, rng){
+  const right = new Uint8Array(cw * ch), down = new Uint8Array(cw * ch); // open passage to the right / below
+  const seen = new Uint8Array(cw * ch);
+  const stack = [0]; seen[0] = 1;
+  const D = [[1,0],[-1,0],[0,1],[0,-1]];
+  const opts = [];
+  while (stack.length){
+    const cur = stack[stack.length - 1], cx = cur % cw, cy = (cur / cw) | 0;
+    opts.length = 0;
+    for (const [dx, dy] of D){
+      const nx = cx + dx, ny = cy + dy;
+      if (nx >= 0 && ny >= 0 && nx < cw && ny < ch && !seen[ny * cw + nx]) opts.push(nx, ny, dx, dy);
+    }
+    if (!opts.length){ stack.pop(); continue; }
+    const k = ((rng() * (opts.length / 4)) | 0) * 4;
+    const nx = opts[k], ny = opts[k+1], dx = opts[k+2], dy = opts[k+3], n = ny * cw + nx;
+    if (dx === 1) right[cur] = 1; else if (dx === -1) right[n] = 1;
+    else if (dy === 1) down[cur] = 1; else down[n] = 1;
+    seen[n] = 1; stack.push(n);
+  }
+  const W = cw * 3 + 1, H = ch * 3 + 1;
+  const g = new Uint8Array(W * H).fill(1);
+  const open = (x, y) => { g[y * W + x] = 0; };
+  for (let cy = 0; cy < ch; cy++) for (let cx = 0; cx < cw; cx++){
+    const ux = 1 + cx * 3, uy = 1 + cy * 3, i = cy * cw + cx;
+    open(ux, uy); open(ux + 1, uy); open(ux, uy + 1); open(ux + 1, uy + 1);
+    if (right[i]){ open(ux + 2, uy); open(ux + 2, uy + 1); }
+    if (down[i]){ open(ux, uy + 2); open(ux + 1, uy + 2); }
+  }
+  return { W, H, g, cw, ch, right, down };
+}
+
+// Distance from (sx,sy) to every floor tile (-1 = unreachable).
+function distanceMap(m, sx, sy){
+  const dist = new Int32Array(m.W * m.H).fill(-1);
+  const q = new Int32Array(m.W * m.H); let h = 0, t = 0;
+  const s = sy * m.W + sx; dist[s] = 0; q[t++] = s;
+  while (h < t){
+    const i = q[h++], d = dist[i] + 1;
+    for (const n of [i + 1, i - 1, i + m.W, i - m.W]){
+      if (m.g[n] === 0 && dist[n] < 0){ dist[n] = d; q[t++] = n; }
+    }
+  }
+  return dist;
+}
+
+/* ---------- 4. GAME STATE + EVENTS ---------- */
+const events = { item:[], newMaze:[], step:[], bump:[], win:[], attack:[], enemyHit:[], enemyDefeated:[], hurt:[], gameOver:[] };
+function on(name, fn){ events[name].push(fn); }
+function emit(name, data){ for (const fn of events[name]) fn(data); }
+
+let G = null; // current game
+
+function startGame(opts = {}){
+  const seed = (opts.seed ?? randomSeed()) >>> 0;
+  const cw = opts.cellsW ?? CONFIG.cellsW, ch = opts.cellsH ?? CONFIG.cellsH;
+  const rng = mulberry32(seed);
+  const maze = generateMaze(cw, ch, rng);
+  const dist = distanceMap(maze, 1, 1);
+  // Exit = the 2x2 cell farthest from the start (stand on any of its 4 squares to win)
+  let best = 0, ex = 1, ey = 1;
+  for (let cy = 0; cy < ch; cy++) for (let cx = 0; cx < cw; cx++){
+    const ux = 1 + cx * 3, uy = 1 + cy * 3, W = maze.W;
+    const d = Math.min(dist[uy * W + ux], dist[uy * W + ux + 1], dist[(uy + 1) * W + ux], dist[(uy + 1) * W + ux + 1]);
+    if (d > best){ best = d; ex = ux; ey = uy; }
+  }
+  G = {
+    seed, rng, maze, dist,
+    start:{ x:1, y:1 }, exit:{ x:ex, y:ey }, pathLength: best,
+    player:{ x:1, y:1, fromX:1, fromY:1, t0:0, moving:false, facing:'down', frame:0,
+             hp:CONFIG.playerMaxHp, invulnUntil:0, hurtAt:-1e9 },
+    swing:null, nextAttackAt:0,
+    has:{}, chests:[], chestAt:new Map(), trail:new Uint8Array(maze.W * maze.H), popups:[],
+    enemies:[],
+    steps:0, startedAt:null, won:false, over:false,
+    mapCanvas: renderMapCanvas(maze),
+    mapLines: renderMapLines(maze),
+    lead:{ x:0, y:0, last:0 },
+  };
+  placeChests();
+  spawnEnemies(CONFIG.enemyCount);
+  hideOverlay(); document.getElementById('toast').classList.remove('show');
+  document.getElementById('seedLabel').textContent = 'Seed ' + seed.toString(36).toUpperCase();
+  layout();
+  emit('newMaze', G);
+}
+
+const isFloor = (x, y) => G && x >= 0 && y >= 0 && x < G.maze.W && y < G.maze.H && G.maze.g[y * G.maze.W + x] === 0;
+const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
+const OPPOSITE = { up:'down', down:'up', left:'right', right:'left' };
+const playing = () => G && !G.won && !G.over;
+const isWalkable = (x, y) => isFloor(x, y) && !G.chestAt.has(y * G.maze.W + x);
+const inExit = (x, y) => x >= G.exit.x && x <= G.exit.x + 1 && y >= G.exit.y && y <= G.exit.y + 1;
+
+/* ---------- 5. PLAYER, COMBAT, ENEMIES ---------- */
+function tryMove(dir, now){
+  const p = G.player; const [dx, dy] = DIRS[dir];
+  p.facing = dir;
+  const nx = p.x + dx, ny = p.y + dy;
+  const chest = isFloor(nx, ny) && G.chestAt.get(ny * G.maze.W + nx);
+  if (chest){ if (!chest.open) openChest(chest, now); else emit('bump', { dir }); return false; }
+  if (!isFloor(nx, ny)){ emit('bump', { dir }); return false; }
+  if (G.startedAt === null) G.startedAt = now;
+  if (G.has.bread) G.trail[p.y * G.maze.W + p.x] = 1;   // drop crumbs on the square you leave
+  p.fromX = p.x; p.fromY = p.y; p.x = nx; p.y = ny;
+  p.t0 = now; p.moving = true; p.frame ^= 1;
+  G.steps++;
+  emit('step', { x:nx, y:ny, dir });
+  return true;
+}
+
+function arrive(now){
+  const p = G.player; p.moving = false;
+  if (inExit(p.x, p.y) && !G.has.key){
+    if (!inExit(p.fromX, p.fromY)) toast('The exit is <b>locked</b>. Find the key!');
+    return;
+  }
+  if (inExit(p.x, p.y)){
+    G.won = true;
+    const secs = ((now - (G.startedAt ?? now)) / 1000).toFixed(1);
+    emit('win', { steps:G.steps, secs });
+    showOverlay('ESCAPED!', false, `${G.steps} steps · ${secs}s · shortest ${G.pathLength}`, false);
+  }
+}
+
+// Tile-unit position of anything that slides between tiles
+function lerpPos(o, now, dur){
+  const t = o.moving ? Math.min(1, (now - o.t0) / dur) : 1;
+  return { x: o.fromX + (o.x - o.fromX) * t, y: o.fromY + (o.y - o.fromY) * t };
+}
+const overlap = (ax, ay, aw, ah, bx, by, bw, bh) => ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+
+function attack(now){
+  if (!playing() || now < G.nextAttackAt) return;
+  if (!G.has.sword){ toast('You have no sword yet. Look in the chests!'); G.nextAttackAt = now + 600; return; }
+  if (G.startedAt === null) G.startedAt = now;
+  G.swing = { t0: now, dir: G.player.facing, hit: new Set() };
+  G.nextAttackAt = now + CONFIG.attackCooldownMs;
+  emit('attack', { dir: G.player.facing });
+}
+
+function updateSwing(now){
+  const sw = G.swing; if (!sw) return;
+  if (now - sw.t0 >= CONFIG.swingMs){ G.swing = null; return; }
+  // Hit area = the tile in front of where the player is drawn
+  sw.dir = G.player.facing;               // sword follows the way you're facing, even mid-swing
+  const pp = lerpPos(G.player, now, CONFIG.moveMs), [dx, dy] = DIRS[sw.dir];
+  // Hit area: a band swordReach px deep in front of the character's front edge, as wide as the character
+  const cx = pp.x * TILE + TILE / 2, cy = pp.y * TILE + TILE / 2, R = CONFIG.swordReach, half = CHAR / 2;
+  const hw = dx ? R : CHAR, hh = dy ? R : CHAR;
+  const hx = dx ? cx + dx * (half + R / 2) - R / 2 : cx - half;
+  const hy = dy ? cy + dy * (half + R / 2) - R / 2 : cy - half;
+  for (const e of G.enemies){
+    if (e.dead || sw.hit.has(e)) continue;
+    const ep = lerpPos(e, now, e.dur);
+    if (overlap(hx, hy, hw, hh, ep.x * TILE + INSET + 1, ep.y * TILE + INSET + 5, CHAR - 2, CHAR - 5)){
+      sw.hit.add(e); hitEnemy(e, sw.dir, now);
+    }
+  }
+}
+
+function hitEnemy(e, dir, now){
+  e.hp--; e.flashUntil = now + 120; e.stunUntil = now + CONFIG.enemyStunMs;
+  emit('enemyHit', { enemy:e, hp:e.hp });
+  if (e.hp <= 0){ e.dead = true; e.deadAt = now; emit('enemyDefeated', { enemy:e }); return; }
+  // knock back one tile if there's room
+  const cur = lerpPos(e, now, e.dur), [dx, dy] = DIRS[dir];
+  const bx = Math.round(cur.x) + dx, by = Math.round(cur.y) + dy;
+  e.fromX = cur.x; e.fromY = cur.y;
+  if (isWalkable(bx, by)){ e.x = bx; e.y = by; } else { e.x = Math.round(cur.x); e.y = Math.round(cur.y); }
+  e.t0 = now; e.dur = CONFIG.knockbackMs; e.moving = true; e.dir = dir;
+}
+
+// One chest per item. Dead-end cells first (tucked in the back of the cell), never the start or exit cell.
+// A chest only ever fills 1 of a cell's 4 squares, so every route stays open.
+function placeChests(){
+  const m = G.maze, cells = [];
+  for (let cy = 0; cy < m.ch; cy++) for (let cx = 0; cx < m.cw; cx++){
+    const ux = 1 + cx * 3, uy = 1 + cy * 3, i = cy * m.cw + cx;
+    if ((cx === 0 && cy === 0) || (ux === G.exit.x && uy === G.exit.y)) continue;
+    const exits = [];
+    if (m.right[i]) exits.push('right');
+    if (m.down[i]) exits.push('down');
+    if (cx > 0 && m.right[i - 1]) exits.push('left');
+    if (cy > 0 && m.down[i - m.cw]) exits.push('up');
+    cells.push({ ux, uy, exits, dead: exits.length === 1, r: G.rng() });
+  }
+  cells.sort((a, b) => (b.dead - a.dead) || (a.r - b.r));
+  const kinds = ITEM_ORDER.slice();
+  for (let i = kinds.length - 1; i > 0; i--){ const j = (G.rng() * (i + 1)) | 0; [kinds[i], kinds[j]] = [kinds[j], kinds[i]]; }
+  for (const item of kinds){
+    const c = cells.shift(); if (!c) break;
+    let sq;
+    if (c.dead){
+      const e = c.exits[0], back = { left:[[1,0],[1,1]], right:[[0,0],[0,1]], up:[[0,1],[1,1]], down:[[0,0],[1,0]] }[e];
+      sq = back[(G.rng() * 2) | 0];
+    } else sq = [[0,0],[1,0],[0,1],[1,1]][(G.rng() * 4) | 0];
+    const chest = { x: c.ux + sq[0], y: c.uy + sq[1], item, open:false };
+    G.chests.push(chest); G.chestAt.set(chest.y * m.W + chest.x, chest);
+  }
+}
+
+function openChest(c, now){
+  c.open = true; G.has[c.item] = true;
+  G.popups.push({ item:c.item, x:c.x, y:c.y, t0:now });
+  toast(`<b>${ITEMS[c.item].name}</b>: ${ITEMS[c.item].desc}`);
+  emit('item', { item:c.item });
+}
+
+function spawnEnemies(n){
+  const m = G.maze, far = Math.max(8, Math.floor(G.pathLength * 0.4));
+  const spots = [];
+  for (let y = 1; y < m.H; y++) for (let x = 1; x < m.W; x++){
+    const d = G.dist[y * m.W + x];
+    if (d >= far && !inExit(x, y) && isWalkable(x, y)) spots.push([x, y]);
+  }
+  for (let i = 0; i < n && spots.length; i++){
+    const [x, y] = spots.splice((G.rng() * spots.length) | 0, 1)[0];
+    G.enemies.push({ x, y, fromX:x, fromY:y, t0:0, dur:CONFIG.enemyMoveMs, moving:false,
+                     dir:'down', hp:CONFIG.enemyHp, stunUntil:0, flashUntil:0, waitUntil:0, dead:false, deadAt:0 });
+  }
+}
+
+function updateEnemies(now){
+  for (const e of G.enemies){
+    if (e.dead) continue;
+    if (e.moving && now - e.t0 >= e.dur){ e.moving = false; e.fromX = e.x; e.fromY = e.y; }
+    if (e.moving || now < e.stunUntil || now < e.waitUntil) continue;
+    // Wander: pick an open direction, avoid turning back unless it's a dead end
+    const opts = Object.keys(DIRS).filter(d => isWalkable(e.x + DIRS[d][0], e.y + DIRS[d][1]));
+    if (!opts.length) continue;
+    const forward = opts.filter(d => d !== OPPOSITE[e.dir]);
+    const pool = forward.length ? forward : opts;
+    if (G.rng() < CONFIG.enemyPauseChance){ e.waitUntil = now + 300 + G.rng() * 500; continue; }
+    const d = (pool.includes(e.dir) && G.rng() < CONFIG.enemyStraightChance) ? e.dir : pool[(G.rng() * pool.length) | 0];
+    e.dir = d; e.fromX = e.x; e.fromY = e.y; e.x += DIRS[d][0]; e.y += DIRS[d][1];
+    e.t0 = now; e.dur = CONFIG.enemyMoveMs; e.moving = true;
+  }
+  G.enemies = G.enemies.filter(e => !e.dead || now - e.deadAt < 400); // keep briefly for the poof
+}
+
+function checkContact(now){
+  const p = G.player; if (now < p.invulnUntil) return;
+  const pp = lerpPos(p, now, CONFIG.moveMs);
+  for (const e of G.enemies){
+    if (e.dead || now < e.stunUntil) continue;
+    const ep = lerpPos(e, now, e.dur);
+    if (overlap(pp.x * TILE + INSET + 3, pp.y * TILE + INSET + 2, CHAR - 6, CHAR - 3,
+                ep.x * TILE + INSET + 2, ep.y * TILE + INSET + 8, CHAR - 4, CHAR - 9)){
+      p.hp = Math.max(0, p.hp - CONFIG.enemyDamage * (G.has.shield ? CONFIG.shieldFactor : 1));
+      p.invulnUntil = now + CONFIG.hurtInvulnMs; p.hurtAt = now;
+      e.waitUntil = now + CONFIG.enemyAfterBiteMs;
+      emit('hurt', { hp:p.hp });
+      if (p.hp <= 0){
+        G.over = true; G.swing = null;
+        emit('gameOver', {});
+        showOverlay('GAME OVER', true, 'The slime got you.', true);
+      }
+      return;
+    }
+  }
+}
+
+/* ---------- 6. INPUT ---------- */
+const input = { keys:[], touch:null, queued:null };
+const KEYMAP = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right',
+                 KeyW:'up', KeyS:'down', KeyA:'left', KeyD:'right' };
+function heldDir(){ return input.touch || input.keys[input.keys.length - 1] || null; }
+
+addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const dir = KEYMAP[e.code];
+  if (dir){
+    e.preventDefault();
+    if (!e.repeat){ if (!input.keys.includes(dir)) input.keys.push(dir); input.queued = dir; }
+    return;
+  }
+  if (e.code === 'Space' || e.code === 'KeyJ'){
+    // On the win / game-over screen, the focused button handles Space and Enter itself
+    if (!playing()) return;
+    e.preventDefault();
+    if (!e.repeat) attack(performance.now());
+  }
+  else if (e.code === 'KeyN'){ e.preventDefault(); startGame(); }
+});
+addEventListener('keyup', e => {
+  const dir = KEYMAP[e.code]; if (!dir) return;
+  input.keys = input.keys.filter(d => d !== dir);
+});
+addEventListener('blur', () => { input.keys = []; input.touch = null; });
+
+// Swipe on the maze to walk (keep holding to keep walking). A quick tap = attack.
+const canvas = document.getElementById('view');
+let swipe = null;
+canvas.addEventListener('pointerdown', e => {
+  swipe = { id:e.pointerId, x:e.clientX, y:e.clientY, t:performance.now(), moved:false };
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!swipe || e.pointerId !== swipe.id) return;
+  const dx = e.clientX - swipe.x, dy = e.clientY - swipe.y;
+  if (Math.hypot(dx, dy) < 22) return;
+  const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+  if (dir !== input.touch) input.queued = dir;
+  input.touch = dir; swipe.x = e.clientX; swipe.y = e.clientY; swipe.moved = true;
+});
+const endSwipe = e => {
+  if (!swipe || e.pointerId !== swipe.id) return;
+  if (e.type === 'pointerup' && !swipe.moved && performance.now() - swipe.t < 300) attack(performance.now());
+  swipe = null; input.touch = null;
+};
+canvas.addEventListener('pointerup', endSwipe);
+canvas.addEventListener('pointercancel', endSwipe);
+
+document.getElementById('newBtn').addEventListener('click', e => { e.currentTarget.blur(); startGame(); });
+document.getElementById('againBtn').addEventListener('click', () => startGame());
+document.getElementById('retryBtn').addEventListener('click', () => startGame({ seed:G.seed }));
+
+/* ---------- 7. RENDER ---------- */
+const ctx = canvas.getContext('2d');
+const view = { scale:1, cw:0, ch:0, dpr:1 };
+const wallPattern = ctx.createPattern(SPR.wallTop[0], 'repeat');
+
+function renderMapCanvas(m){
+  const c = document.createElement('canvas'); c.width = m.W * TILE; c.height = m.H * TILE;
+  const x = c.getContext('2d');
+  const wall = (tx, ty) => tx < 0 || ty < 0 || tx >= m.W || ty >= m.H || m.g[ty * m.W + tx] === 1;
+  const pick = (arr, tx, ty) => arr[(((tx * 73856093) ^ (ty * 19349663)) >>> 0) % arr.length]; // stable per-tile variety
+  for (let ty = 0; ty < m.H; ty++) for (let tx = 0; tx < m.W; tx++){
+    const X = tx * TILE, Y = ty * TILE;
+    if (wall(tx, ty)){
+      x.drawImage(wall(tx, ty + 1) ? pick(SPR.wallTop, tx, ty) : pick(SPR.wallFace, tx, ty), X, Y);
+      // dark rim where the wall top meets open floor
+      x.fillStyle = '#23263a';
+      if (!wall(tx - 1, ty)) x.fillRect(X, Y, 1, TILE);
+      if (!wall(tx + 1, ty)) x.fillRect(X + TILE - 1, Y, 1, TILE);
+      if (!wall(tx, ty - 1)) x.fillRect(X, Y, TILE, 1);
+    } else {
+      x.drawImage(pick(SPR.floor, tx, ty), X, Y);
+      // soft shadows cast by walls above and to the left
+      x.fillStyle = 'rgba(0,0,0,.28)';
+      if (wall(tx, ty - 1)) x.fillRect(X, Y, TILE, 2);
+      if (wall(tx - 1, ty)) x.fillRect(X, Y, 1, TILE);
+    }
+  }
+  return c;
+}
+
+// Map item: dotted outline of every wall edge, drawn once per maze. 1 pixel on, 2 off.
+function renderMapLines(m){
+  const c = document.createElement('canvas'); c.width = m.W * TILE; c.height = m.H * TILE;
+  const x = c.getContext('2d'); x.fillStyle = CONFIG.mapLineColor;
+  const wall = (tx, ty) => tx < 0 || ty < 0 || tx >= m.W || ty >= m.H || m.g[ty * m.W + tx] === 1;
+  for (let ty = 0; ty < m.H; ty++) for (let tx = 0; tx < m.W; tx++){
+    if (wall(tx, ty)) continue;
+    const X = tx * TILE, Y = ty * TILE, E = TILE - 1;
+    for (let i = 0; i < TILE; i++){
+      const hx = X + i, vy = Y + i;
+      if (hx % 3 === 0){
+        if (wall(tx, ty - 1)) x.fillRect(hx, Y, 1, 1);
+        if (wall(tx, ty + 1)) x.fillRect(hx, Y + E, 1, 1);
+      }
+      if (vy % 3 === 0){
+        if (wall(tx - 1, ty)) x.fillRect(X, vy, 1, 1);
+        if (wall(tx + 1, ty)) x.fillRect(X + E, vy, 1, 1);
+      }
+    }
+  }
+  return c;
+}
+const mapTmp = document.createElement('canvas'), mapTmpCtx = mapTmp.getContext('2d');
+
+function layout(){
+  const stage = document.getElementById('stage');
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  view.dpr = dpr;
+  view.cw = Math.max(1, Math.round(stage.clientWidth * dpr));
+  view.ch = Math.max(1, Math.round(stage.clientHeight * dpr));
+  canvas.width = view.cw; canvas.height = view.ch;
+  view.scale = Math.max(1, Math.round(Math.min(view.cw, view.ch) / (CONFIG.viewTiles * TILE)));
+}
+new ResizeObserver(layout).observe(document.getElementById('stage'));
+
+const px = v => Math.round(v * TILE); // tile units -> whole art pixels
+
+function render(now){
+  const s = view.scale, vw = view.cw / s, vh = view.ch / s;
+  const p = G.player, pt = lerpPos(p, now, CONFIG.moveMs);
+  const ppx = px(pt.x), ppy = px(pt.y);
+
+  // camera locked on the player: character stays centered, the world moves
+  const camX = ppx + TILE / 2 - vw / 2, camY = ppy + TILE / 2 - vh / 2;
+  const ox = Math.round(-camX * s), oy = Math.round(-camY * s);
+
+  // lean toward the walking direction
+  const L = G.lead;
+  const dt = Math.min(0.1, (now - (L.last || now)) / 1000); L.last = now;
+  const [ldx, ldy] = p.moving && playing() ? DIRS[p.facing] : [0, 0];
+  const k = 1 - Math.exp(-CONFIG.leadEase * dt);
+  L.x += (ldx - L.x) * k; L.y += (ldy - L.y) * k;
+  const lx = Math.round(L.x * CONFIG.leadPx), ly = Math.round(L.y * CONFIG.leadPx);
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.setTransform(s, 0, 0, s, ox, oy);
+  ctx.fillStyle = wallPattern; // solid wall beyond the maze edge
+  ctx.fillRect(Math.floor(camX / TILE) * TILE - TILE, Math.floor(camY / TILE) * TILE - TILE, vw + TILE * 3, vh + TILE * 3);
+
+  ctx.drawImage(G.mapCanvas, 0, 0);                          // map
+  // breadcrumb trail (only squares near the screen)
+  const tx0 = Math.max(0, Math.floor(camX / TILE) - 1), ty0 = Math.max(0, Math.floor(camY / TILE) - 1);
+  const tx1 = Math.min(G.maze.W - 1, tx0 + Math.ceil(vw / TILE) + 2), ty1 = Math.min(G.maze.H - 1, ty0 + Math.ceil(vh / TILE) + 2);
+  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++){
+    if (!G.trail[ty * G.maze.W + tx]) continue;
+    let h = ((tx * 73856093) ^ (ty * 19349663)) >>> 0;
+    for (let c = 0; c < 3; c++){
+      ctx.fillStyle = c === 1 ? '#c98a3e' : '#e8b86a';
+      ctx.fillRect(tx * TILE + 3 + (h & 7) + c * 1, ty * TILE + 3 + ((h >> 3) & 7) + c, c === 0 ? 2 : 1, 1);
+      h = (h >>> 5) ^ (h * 2654435761 >>> 0);
+    }
+  }
+  ctx.drawImage(SPR.exit, G.exit.x * TILE + TILE / 2, G.exit.y * TILE + TILE / 2); // exit flag, centered in its 2x2 cell
+  if (!G.has.key) ctx.drawImage(SPR.lock, G.exit.x * TILE + TILE / 2 + 9, G.exit.y * TILE + TILE / 2 + 7);
+  for (const c of G.chests) ctx.drawImage(SPR.chest[c.open ? 1 : 0], c.x * TILE, c.y * TILE);
+
+  for (const e of G.enemies){                                // enemies
+    const ep = lerpPos(e, now, e.dur), ex = px(ep.x) + INSET, ey = px(ep.y) + INSET;
+    if (e.dead){ ctx.drawImage(SPR.poof[now - e.deadAt < 200 ? 0 : 1], ex, ey); continue; }
+    const f = (now < e.stunUntil) ? 1 : ((now / 250) | 0) % 2; // squish animation
+    ctx.drawImage(now < e.flashUntil ? SPR.slimeFlash[f] : SPR.slime[f], ex, ey);
+  }
+
+  const sw = G.swing;
+  const swordFrame = sw ? Math.min(2, ((now - sw.t0) / (CONFIG.swingMs / 3)) | 0) : 0;
+  const drawSword = () => {
+    if (!sw) return;
+    const [dx, dy] = DIRS[sw.dir];
+    // 16x16 sword canvas centered 12px out from the character's center: hilt at its edge, tip ~7px past it
+    ctx.drawImage(SPR.sword[sw.dir][swordFrame], ppx + TILE / 2 + lx + dx * 12 - 8, ppy + TILE / 2 + ly + dy * 12 - 8);
+  };
+  if (sw && sw.dir === 'up') drawSword();                    // sword behind player when facing up
+  const blink = now < p.invulnUntil && ((now / 80) | 0) % 2 === 0;
+  if (!blink){
+    const frames = SPR.hero[p.facing];
+    ctx.drawImage(p.moving ? frames[1 + p.frame] : frames[0], ppx + INSET + lx, ppy + INSET + ly);
+  }
+  if (sw && sw.dir !== 'up') drawSword();
+  // found-item icons rising out of their chests
+  G.popups = G.popups.filter(pu => now - pu.t0 < 1200);
+  for (const pu of G.popups){
+    const t = (now - pu.t0) / 1200;
+    ctx.globalAlpha = t < 0.75 ? 1 : (1 - t) * 4;
+    ctx.drawImage(SPR.items[pu.item], pu.x * TILE, pu.y * TILE - 6 - Math.round(Math.min(1, t * 3) * 10));
+    ctx.globalAlpha = 1;
+  }
+
+  // darkness: everything outside the light circle around you
+  const dark = darknessCanvas(vw, vh);
+  const dX = ppx + TILE / 2 - dark.width / 2, dY = ppy + TILE / 2 - dark.height / 2;
+  ctx.drawImage(dark, dX, dY);
+  // map: dotted outline of the maze, only out in the dark (hidden inside your light)
+  if (G.has.map){
+    if (mapTmp.width !== dark.width || mapTmp.height !== dark.height){ mapTmp.width = dark.width; mapTmp.height = dark.height; }
+    mapTmpCtx.globalCompositeOperation = 'source-over';
+    mapTmpCtx.clearRect(0, 0, mapTmp.width, mapTmp.height);
+    mapTmpCtx.drawImage(G.mapLines, -dX, -dY);
+    mapTmpCtx.globalCompositeOperation = 'destination-in';
+    mapTmpCtx.drawImage(dark, 0, 0);
+    mapTmpCtx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(mapTmp, dX, dY);
+  }
+
+  // red flash when hurt
+  const hurtT = now - p.hurtAt;
+  if (hurtT < 150){
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = `rgba(232,59,59,${0.28 * (1 - hurtT / 150)})`;
+    ctx.fillRect(0, 0, view.cw, view.ch);
+  }
+  drawHUD(now);
+}
+
+// Darkness mask at art-pixel resolution, centered on the player (who is always centered on screen).
+// Rebuilt only when the view size, torch or map changes. Dithered edge for a pixel-art look.
+const darkCache = { key:'', cv:null };
+function darknessCanvas(vw, vh){
+  const r = CONFIG.lightRadius * (G.has.torch ? CONFIG.torchMultiplier : 1);
+  const outer = 1;
+  const W = (Math.ceil(vw) + 8) & ~1, H = (Math.ceil(vh) + 8) & ~1;
+  const key = [W, H, r, outer].join();
+  if (darkCache.key === key) return darkCache.cv;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d'), img = x.createImageData(W, H), d = img.data;
+  const cx = W / 2, cy = H / 2;
+  for (let y = 0; y < H; y++) for (let X = 0; X < W; X++){
+    const dist = Math.hypot(X + 0.5 - cx, y + 0.5 - cy), odd = (X + y) & 1;
+    let a;
+    if (dist < r) a = 0;
+    else if (dist < r + 3) a = odd ? outer * 0.35 : outer * 0.7;
+    else if (dist < r + 6) a = odd ? outer * 0.85 : outer;
+    else a = outer;
+    const i = (y * W + X) * 4; d[i] = 6; d[i + 1] = 6; d[i + 2] = 12; d[i + 3] = (a * 255) | 0;
+  }
+  x.putImageData(img, 0, 0);
+  darkCache.key = key; darkCache.cv = c;
+  return c;
+}
+
+// Health bar: heart + segmented bar, drawn in screen space in chunky pixels
+function drawHUD(now){
+  const hs = Math.max(Math.ceil(2 * view.dpr), Math.round(view.scale * 1.2));
+  const m = Math.round(10 * view.dpr);
+  ctx.setTransform(hs, 0, 0, hs, m, m);
+  const segs = Math.round(CONFIG.playerMaxHp / CONFIG.enemyDamage) || 5;
+  const segW = 7, bw = segs * segW + (segs - 1) + 2, bx = 9;
+  ctx.drawImage(SPR.heart, 0, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(bx - 1, -1, bw + 2, 8);
+  ctx.fillStyle = '#3a3f5c'; ctx.fillRect(bx, 0, bw, 6);
+  const frac = G.player.hp / CONFIG.playerMaxHp;
+  const col = frac > 0.4 ? '#5fc95a' : frac > 0.2 ? '#f0d060' : '#e83b3b';
+  const hurtBlink = now - G.player.hurtAt < 300 && ((now / 60) | 0) % 2 === 0;
+  for (let i = 0; i < segs; i++){
+    const sx = bx + 1 + i * (segW + 1);
+    ctx.fillStyle = '#23263a'; ctx.fillRect(sx, 1, segW, 4);
+    const segFill = Math.max(0, Math.min(1, frac * segs - i));
+    if (segFill > 0){
+      ctx.fillStyle = hurtBlink ? '#ffffff' : col; ctx.fillRect(sx, 1, Math.round(segW * segFill), 4);
+      ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(sx, 1, Math.round(segW * segFill), 1);
+    }
+  }
+  // inventory: found items in full color, missing ones as faint shapes
+  const is = Math.max(1, Math.round(hs / 2));
+  ctx.setTransform(is, 0, 0, is, m, m + 10 * hs);
+  ITEM_ORDER.forEach((k, i) => {
+    const x = i * 18;
+    ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(x, 0, 17, 17);
+    ctx.globalAlpha = G.has[k] ? 1 : 0.13;
+    ctx.drawImage(SPR.items[k], x, 0);
+    ctx.globalAlpha = 1;
+  });
+}
+
+/* ---------- 8. LOOP + BOOT ---------- */
+function update(now){
+  const p = G.player;
+  if (playing()){
+    if (p.moving && now - p.t0 >= CONFIG.moveMs) arrive(now);
+  }
+  if (playing()){
+    updateEnemies(now);
+    updateSwing(now);
+    checkContact(now);
+    if (!p.moving && playing()){            // you can keep walking while swinging
+      const dir = input.queued || heldDir();
+      input.queued = null;
+      if (dir) tryMove(dir, now);
+    }
+  }
+}
+function frame(now){
+  if (G){ update(now); render(now); }
+  requestAnimationFrame(frame);
+}
+function showOverlay(title, bad, text, retry){
+  const t = document.getElementById('ovTitle'); t.textContent = title; t.classList.toggle('bad', bad);
+  document.getElementById('ovText').textContent = text;
+  document.getElementById('retryBtn').style.display = retry ? '' : 'none';
+  document.getElementById('overlay').classList.add('show');
+  document.getElementById(retry ? 'retryBtn' : 'againBtn').focus();
+}
+let toastTimer = 0;
+function toast(html, ms = 2600){
+  const t = document.getElementById('toast'); t.innerHTML = html; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), ms);
+}
+function hideOverlay(){ document.getElementById('overlay').classList.remove('show'); }
+
+startGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
